@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Футбол – Универсальный запуск по клику</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    /* Большое табло с подсказками */
+    #scoreboard {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      font-family: sans-serif;
+      background: rgba(0,0,0,0.7);
+      padding: 20px;
+      border-radius: 10px;
+      z-index: 100;
+      font-size: 32px;
+      line-height: 1.3em;
+      max-width: 60%;
+    }
+  </style>
+</head>
+<body>
+  <div id="scoreboard">Загрузка данных...</div>
+  
+  <!-- Подключаем Three.js и OrbitControls -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  
+  <script>
+    // Флаг, что игра запущена
+    let gameStarted = false;
+    
+    // ===============================
+    // 1. Получение реальной погоды (Тель-Авив)
+    // ===============================
+    let realWeather = "Погода: нет данных";
+    function fetchWeather() {
+      const lat = 32.0853, lon = 34.7818;
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true&timezone=Asia/Jerusalem`;
+      fetch(url)
+        .then(response => response.json())
+        .then(data => {
+          if (data && data.current_weather) {
+            const temp = data.current_weather.temperature;
+            realWeather = `Погода: ${temp.toFixed(1)} °C`;
+          } else { realWeather = "Погода: нет данных"; }
+        })
+        .catch(() => { realWeather = "Погода: ошибка запроса"; });
+    }
+    fetchWeather();
+    
+    // ===============================
+    // 2. Вспомогательные функции
+    // ===============================
+    function clampVelocity(vector, maxSpeed) {
+      if (vector.length() > maxSpeed) { vector.setLength(maxSpeed); }
+    }
+    function clampPlayerPosition(player) {
+      if (player.position.x < -49.5) { player.position.x = -49.5; player.userData.velocity.x *= -0.5; }
+      if (player.position.x > 49.5) { player.position.x = 49.5; player.userData.velocity.x *= -0.5; }
+      if (player.position.z < -29.5) { player.position.z = -29.5; player.userData.velocity.z *= -0.5; }
+      if (player.position.z > 29.5) { player.position.z = 29.5; player.userData.velocity.z *= -0.5; }
+    }
+    
+    // ===============================
+    // 3. Сцена, камера, рендерер и OrbitControls
+    // ===============================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+    
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(-80, 50, 0);
+    camera.lookAt(0, 0, 0);
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 0, 0);
+    
+    // ===============================
+    // 4. Освещение
+    // ===============================
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(50, 50, 50);
+    scene.add(dirLight);
+    
+    // ===============================
+    // 5. Аудио (фон, удар, гол)
+    // ===============================
+    const listener = new THREE.AudioListener();
+    camera.add(listener);
+    const bgMusic = new THREE.Audio(listener);
+    const hitSound = new THREE.Audio(listener);
+    const goalSound = new THREE.Audio(listener);
+    const audioLoader = new THREE.AudioLoader();
+    audioLoader.load('background.mp3', buffer => {
+      bgMusic.setBuffer(buffer);
+      bgMusic.setLoop(true);
+      bgMusic.setVolume(0.3);
+      bgMusic.play();
+    });
+    audioLoader.load('hit.mp3', buffer => {
+      hitSound.setBuffer(buffer);
+      hitSound.setVolume(0.5);
+    });
+    audioLoader.load('goal.mp3', buffer => {
+      goalSound.setBuffer(buffer);
+      goalSound.setVolume(1.0);
+    });
+    
+    // ===============================
+    // 6. Футбольное поле и ворота (горизонтальное)
+    // ===============================
+    // Поле: X от -50 до 50, Z от -30 до 30
+    const fieldGeometry = new THREE.PlaneGeometry(100, 60);
+    const fieldMaterial = new THREE.MeshLambertMaterial({ color: 0x006400 });
+    const field = new THREE.Mesh(fieldGeometry, fieldMaterial);
+    field.rotation.x = -Math.PI/2;
+    scene.add(field);
+    
+    const goalMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    const goalWidth = 20, goalHeight = 10, goalDepth = 2;
+    const goalA = new THREE.Mesh(new THREE.BoxGeometry(goalDepth, goalHeight, goalWidth), goalMaterial);
+    goalA.position.set(-51, goalHeight/2, 0);
+    scene.add(goalA);
+    const goalB = new THREE.Mesh(new THREE.BoxGeometry(goalDepth, goalHeight, goalWidth), goalMaterial);
+    goalB.position.set(51, goalHeight/2, 0);
+    scene.add(goalB);
+    
+    // ===============================
+    // 7. Мяч (оранжевый)
+    // ===============================
+    const ballRadius = 1.5;
+    const ballGeometry = new THREE.SphereGeometry(ballRadius, 32, 32);
+    const ballMaterial = new THREE.MeshLambertMaterial({ color: 0xffa500 });
+    const ball = new THREE.Mesh(ballGeometry, ballMaterial);
+    ball.position.set(0, ballRadius, 0);
+    ball.userData.velocity = new THREE.Vector3();
+    scene.add(ball);
+    
+    function resetBall() {
+      ball.position.set(0, ballRadius, 0);
+      ball.position.x += (Math.random()-0.5)*2;
+      ball.position.z += (Math.random()-0.5)*2;
+      ball.userData.velocity.set(0, 0, 0);
+    }
+    
+    // ===============================
+    // 8. Игроки (две команды)
+    // ===============================
+    const players = [];
+    function createPlayer(color, pos, role) {
+      const group = new THREE.Group();
+      const headGeom = new THREE.SphereGeometry(0.8, 16, 16);
+      const headMat = new THREE.MeshLambertMaterial({ color: color });
+      const head = new THREE.Mesh(headGeom, headMat);
+      head.position.set(0, 1.8, 0);
+      group.add(head);
+      const bodyGeom = new THREE.CylinderGeometry(0.5, 0.5, 2, 16);
+      const bodyMat = new THREE.MeshLambertMaterial({ color: color });
+      const body = new THREE.Mesh(bodyGeom, bodyMat);
+      body.position.set(0, 0.8, 0);
+      group.add(body);
+      group.position.copy(pos);
+      group.userData = {
+        role: role,
+        velocity: new THREE.Vector3(),
+        initialPosition: pos.clone()
+      };
+      scene.add(group);
+      players.push(group);
+    }
+    // Команда A (синие, слева)
+    createPlayer(0x0000ff, new THREE.Vector3(-30, 0, -10), "defender");
+    createPlayer(0x0000ff, new THREE.Vector3(-30, 0, 10), "defender");
+    createPlayer(0x0000ff, new THREE.Vector3(-15, 0, -5), "attacker");
+    createPlayer(0x0000ff, new THREE.Vector3(-20, 0, 5), "attacker");
+    // Команда B (белые, справа)
+    createPlayer(0xffffff, new THREE.Vector3(30, 0, -10), "defender");
+    createPlayer(0xffffff, new THREE.Vector3(30, 0, 10), "defender");
+    createPlayer(0xffffff, new THREE.Vector3(15, 0, 5), "attacker");
+    createPlayer(0xffffff, new THREE.Vector3(20, 0, -5), "attacker");
+    
+    function resetPlayers() {
+      players.forEach(p => {
+        p.position.copy(p.userData.initialPosition);
+        p.position.x += (Math.random()-0.5)*1;
+        p.position.z += (Math.random()-0.5)*1;
+        p.userData.velocity.set(0, 0, 0);
+      });
+    }
+    
+    // ===============================
+    // 9. Счёт, сообщения и пауза после гола
+    // ===============================
+    let scoreA = 0, scoreB = 0;
+    let goalMessage = "";
+    let goalMessageTime = 0;
+    let helloMessage = "";
+    let helloMessageTime = 0;
+    let lastHelloTime = 0;
+    let isKickOffPause = false;
+    let kickOffEndTime = 0;
+    function showGoalMessage() {
+      goalMessage = "ГОЛ!";
+      goalMessageTime = Date.now();
+    }
+    function maybeShowHello() {
+      const now = Date.now();
+      if (now - lastHelloTime > 30000 && Math.random() < 0.005) {
+        helloMessage = "Привет всем друзьям Деревяшкина!";
+        helloMessageTime = now;
+        lastHelloTime = now;
+      }
+    }
+    
+    // ===============================
+    // 10. Обработка кликов/касаний по мячу (универсально)
+    // ===============================
+    function onUserInteraction(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      let x, y;
+      if (event.type === 'pointerdown' || event.type === 'mousedown') {
+        x = event.clientX;
+        y = event.clientY;
+      } else if (event.type === 'touchstart') {
+        x = event.touches[0].clientX;
+        y = event.touches[0].clientY;
+      }
+      mouse.x = (x / window.innerWidth) * 2 - 1;
+      mouse.y = - (y / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(ball);
+      if (intersects.length > 0) {
+        if (!gameStarted) { gameStarted = true; }
+        const impulse = new THREE.Vector3(
+          (Math.random()-0.5)*1,
+          0,
+          (Math.random()-0.5)*1
+        );
+        ball.userData.velocity.add(impulse);
+        if (!hitSound.isPlaying) hitSound.play();
+      }
+    }
+    // Добавляем универсальные обработчики
+    if (window.PointerEvent) {
+      renderer.domElement.addEventListener('pointerdown', onUserInteraction, false);
+    } else {
+      renderer.domElement.addEventListener('mousedown', onUserInteraction, false);
+      renderer.domElement.addEventListener('touchstart', onUserInteraction, false);
+    }
+    
+    // ===============================
+    // 11. Главный цикл анимации
+    // ===============================
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      maybeShowHello();
+      const now = Date.now();
+      
+      if (!gameStarted) {
+        document.getElementById('scoreboard').innerHTML = `
+          Нажмите по мячу для старта!
+          <br><br>Управление камерой:
+          <br>ЛКМ – вращение, Колёсико – зум, ПКМ/Ctrl+ЛКМ – панорамирование
+          <br><br>${realWeather}
+        `;
+        renderer.render(scene, camera);
+        return;
+      }
+      
+      if (isKickOffPause && now >= kickOffEndTime) { isKickOffPause = false; }
+      
+      if (!isKickOffPause) {
+        ball.position.add(ball.userData.velocity);
+        clampVelocity(ball.userData.velocity, 1.5);
+        ball.userData.velocity.multiplyScalar(0.98);
+      }
+      
+      if (ball.position.x - ballRadius < -50) {
+        if (Math.abs(ball.position.z) < 10) {
+          scoreB++;
+          goalSound.play();
+          showGoalMessage();
+          resetBall();
+          resetPlayers();
+          isKickOffPause = true;
+          kickOffEndTime = now + 3000;
+        } else {
+          ball.position.x = -50 + ballRadius;
+          ball.userData.velocity.x = -ball.userData.velocity.x;
+          if (!hitSound.isPlaying) hitSound.play();
+        }
+      }
+      if (ball.position.x + ballRadius > 50) {
+        if (Math.abs(ball.position.z) < 10) {
+          scoreA++;
+          goalSound.play();
+          showGoalMessage();
+          resetBall();
+          resetPlayers();
+          isKickOffPause = true;
+          kickOffEndTime = now + 3000;
+        } else {
+          ball.position.x = 50 - ballRadius;
+          ball.userData.velocity.x = -ball.userData.velocity.x;
+          if (!hitSound.isPlaying) hitSound.play();
+        }
+      }
+      if (ball.position.z - ballRadius < -30) {
+        ball.position.z = -30 + ballRadius;
+        ball.userData.velocity.z = -ball.userData.velocity.z;
+        if (!hitSound.isPlaying) hitSound.play();
+      }
+      if (ball.position.z + ballRadius > 30) {
+        ball.position.z = 30 - ballRadius;
+        ball.userData.velocity.z = -ball.userData.velocity.z;
+        if (!hitSound.isPlaying) hitSound.play();
+      }
+      
+      players.forEach(player => {
+        if (!isKickOffPause) {
+          let target, speedFactor;
+          if (player.userData.role === "attacker") {
+            target = ball.position;
+            speedFactor = (player.position.distanceTo(ball.position) < 15) ? 0.1 : 0.05;
+          } else {
+            target = player.userData.initialPosition;
+            speedFactor = 0.025;
+          }
+          let direction = new THREE.Vector3().subVectors(target, player.position);
+          player.userData.velocity.add(direction.multiplyScalar(speedFactor));
+          clampVelocity(player.userData.velocity, 0.75);
+          player.userData.velocity.multiplyScalar(0.9);
+          player.position.add(player.userData.velocity);
+          clampPlayerPosition(player);
+          if (player.position.distanceTo(ball.position) < ballRadius + 1.5) {
+            let impulse = new THREE.Vector3().subVectors(ball.position, player.position).normalize().multiplyScalar(0.3);
+            ball.userData.velocity.add(impulse);
+            if (!hitSound.isPlaying) hitSound.play();
+          }
+        }
+      });
+      
+      ball.position.y = ballRadius;
+      ball.userData.velocity.y = 0;
+      players.forEach(p => { p.position.y = 0; p.userData.velocity.y = 0; });
+      
+      let scoreboardHTML = `
+        Управление камерой:
+        <br>ЛКМ – вращение, Колёсико – зум, ПКМ/Ctrl+ЛКМ – панорамирование
+        <br><br>Счёт: ${scoreA} - ${scoreB}
+        <br>Время: ${new Date().toLocaleTimeString()}
+        <br>${realWeather}
+      `;
+      if (goalMessage && now - goalMessageTime < 2000) {
+        scoreboardHTML += `<br><strong style="color:yellow;">${goalMessage}</strong>`;
+      }
+      if (helloMessage && now - helloMessageTime < 3000) {
+        scoreboardHTML += `<br><span style="color:cyan;">${helloMessage}</span>`;
+      }
+      if (isKickOffPause) {
+        scoreboardHTML += `<br><em style="color:orange;">Пауза...</em>`;
+      }
+      document.getElementById('scoreboard').innerHTML = scoreboardHTML;
+      
+      renderer.render(scene, camera);
+    }
+    
+    animate();
+    
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
